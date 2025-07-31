@@ -1,6 +1,6 @@
-# ida README
+# ira README
 
-This is the README for your extension "ida". After writing up a brief description, we recommend including the following sections.
+This is the README for your extension "ira". After writing up a brief description, we recommend including the following sections.
 
 ## Features
 
