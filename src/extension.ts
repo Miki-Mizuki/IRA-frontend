@@ -204,7 +204,7 @@ function getWebviewContent() {
 
 async function queryModel(errorCode: string): Promise<string> {
   const { default: fetch } = await import('node-fetch');
-  const HF_TOKEN = '***REMOVED***';
+  const HF_TOKEN = ''; // Replace with your HuggingFace token
   const API_URL = 'https://router.huggingface.co/v1/chat/completions';
 
   const payload = {
