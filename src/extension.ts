@@ -47,10 +47,10 @@ function cmdLink(title: string, command: string, args: unknown[]): vscode.Markdo
 
 // Parse the model output (more robust)
 function parseHRA(raw: string): { hint: string; reasoning: string; answer: string } {
-  console.log('[IRA] Raw API response:', raw); // 调试日志
+  console.log('[IRA] Raw API response:', raw);
   
   if (!raw || typeof raw !== 'string') {
-    console.log('[IRA] Invalid raw response:', raw); // 调试日志
+    console.log('[IRA] Invalid raw response:', raw);
     return { hint: 'No hint.', reasoning: 'No reasoning.', answer: 'No answer.' };
   }
 
@@ -62,7 +62,7 @@ function parseHRA(raw: string): { hint: string; reasoning: string; answer: strin
   let reasoning = reasoningMatch?.[1]?.trim();
   let answer = answerMatch?.[1]?.trim();
 
-  console.log('[IRA] Parsed matches:', { hint, reasoning, answer }); // 调试日志
+  console.log('[IRA] Parsed matches:', { hint, reasoning, answer });
 
   if (!hint || !reasoning || !answer) {
     // Fallback: line-based extraction
@@ -72,8 +72,8 @@ function parseHRA(raw: string): { hint: string; reasoning: string; answer: strin
     hint = hint || findLine('hint') || 'No hint.';
     reasoning = reasoning || findLine('reasoning') || 'No reasoning.';
     answer = answer || findLine('answer') || 'No answer.';
-    
-    console.log('[IRA] Fallback parsing result:', { hint, reasoning, answer }); // 调试日志
+
+    console.log('[IRA] Fallback parsing result:', { hint, reasoning, answer });
   }
 
   // Wrap Answer in a code block for clarity
@@ -197,7 +197,6 @@ export function activate(context: vscode.ExtensionContext) {
           const parsed = parseHRA(fullText);
           const hra = { ...parsed, fetched: true, hintOpened: false, reasoningOpened: false, answerOpened: false };
           hraCache.set(k, hra);
-          // 不立即保存，等到用户再次运行 Python 文件时再保存
         } catch (e) {
           console.error('[IRA] Prefetch error:', e);
         }
@@ -227,10 +226,9 @@ export function activate(context: vscode.ExtensionContext) {
         // Do not save here; defer saving until the user finishes the flow
       }
 
-      // 标记 Hint 已打开
       hra.hintOpened = true;
       hraCache.set(k, hra);
-      // 不立即保存，等到用户"用完"功能时再保存
+      // Not saving here; saving happens when the user presses Done or during file activation logic
 
       const thread = activeThreads.get(uri.toString());
       if (!thread) return;
@@ -254,7 +252,7 @@ export function activate(context: vscode.ExtensionContext) {
       // Mark Reasoning as opened
       hra.reasoningOpened = true;
       hraCache.set(k, hra);
-      // 不立即保存，等到用户"用完"功能时再保存
+      // Not saving here; saving happens when the user presses Done or during file activation logic
 
       const thread = activeThreads.get(uri.toString());
       if (!thread) return;
@@ -375,7 +373,7 @@ function getWebviewContent() {
 
 // Model: fetch once via streaming and display step-by-step
 async function queryModelStream(codeSnippet: string): Promise<string> {
-  console.log('[IRA] Querying model for code:', codeSnippet); // 调试日志
+  console.log('[IRA] Querying model for code:', codeSnippet);
   
   const prompt =
 `You are a concise and accurate Python assistant.
@@ -395,7 +393,7 @@ ${codeSnippet}
 \`\`\`
 [END]`;
 
-  console.log('[IRA] Sending prompt:', prompt); // 调试日志
+  console.log('[IRA] Sending prompt:', prompt);
 
   let result = '';
   try {
@@ -412,7 +410,7 @@ ${codeSnippet}
       if (delta) result += delta;
     }
     
-    console.log('[IRA] API response received:', result); // 调试日志
+    console.log('[IRA] API response received:', result);
     return result;
   } catch (err) {
     console.error('[IRA] 🔥 Streaming fetch error:', err);
