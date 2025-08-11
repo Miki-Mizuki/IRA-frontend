@@ -9,7 +9,7 @@ import * as path from 'path';
 
 config();
 
-const HF_TOKEN = process.env.HF_TOKEN || '***REMOVED***';
+const HF_TOKEN = process.env.HF_TOKEN || 'change this to your Hugging Face token';
 const client = new InferenceClient(HF_TOKEN);
 
 let isHintEnabled = false;
