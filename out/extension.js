@@ -43,9 +43,8 @@ const dotenv_1 = require("dotenv");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 (0, dotenv_1.config)();
-const HF_TOKEN = process.env.HF_TOKEN || 'change this to your Hugging Face token';
+const HF_TOKEN = process.env.HF_TOKEN || 'replace_with_your_token';
 const client = new inference_1.InferenceClient(HF_TOKEN);
-let isHintEnabled = false;
 const activeThreads = new Map();
 // Lines that should show a CodeLens
 const pendingReasonKeys = new Set();
@@ -63,9 +62,9 @@ function cmdLink(title, command, args) {
 }
 // Parse the model output (more robust)
 function parseHRA(raw) {
-    console.log('[IRA] Raw API response:', raw); // 调试日志
+    console.log('[IRA] Raw API response:', raw);
     if (!raw || typeof raw !== 'string') {
-        console.log('[IRA] Invalid raw response:', raw); // 调试日志
+        console.log('[IRA] Invalid raw response:', raw);
         return { hint: 'No hint.', reasoning: 'No reasoning.', answer: 'No answer.' };
     }
     const hintMatch = raw.match(/^\s*Hint\s*:\s*(.*?)(?=^\s*Reasoning\s*:|^\s*Answer\s*:|$)/ims);
@@ -74,7 +73,7 @@ function parseHRA(raw) {
     let hint = hintMatch?.[1]?.trim();
     let reasoning = reasoningMatch?.[1]?.trim();
     let answer = answerMatch?.[1]?.trim();
-    console.log('[IRA] Parsed matches:', { hint, reasoning, answer }); // 调试日志
+    console.log('[IRA] Parsed matches:', { hint, reasoning, answer });
     if (!hint || !reasoning || !answer) {
         // Fallback: line-based extraction
         const lines = raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
@@ -82,7 +81,7 @@ function parseHRA(raw) {
         hint = hint || findLine('hint') || 'No hint.';
         reasoning = reasoning || findLine('reasoning') || 'No reasoning.';
         answer = answer || findLine('answer') || 'No answer.';
-        console.log('[IRA] Fallback parsing result:', { hint, reasoning, answer }); // 调试日志
+        console.log('[IRA] Fallback parsing result:', { hint, reasoning, answer });
     }
     // Wrap Answer in a code block for clarity
     if (!/```/.test(answer)) {
@@ -163,66 +162,59 @@ function activate(context) {
         thread.canReply = false;
         thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
         activeThreads.set(uri.toString(), thread);
-        // Initially show only the "Show Hint" button
+        // Show loading state immediately
         thread.comments = [
             {
                 mode: vscode.CommentMode.Preview,
                 author: { name: 'IRA 🤖' },
-                body: cmdLink('👉 Show Hint', 'ida.showHintForLine', [uri.toString(), line])
+                body: new vscode.MarkdownString('🤖 **AI is generating...**')
             }
         ];
-        // Prefetch asynchronously after CodeLens click (non-blocking)
-        (async () => {
-            try {
-                const existing = hraCache.get(k);
-                if (existing?.fetched)
-                    return;
-                const doc = await vscode.workspace.openTextDocument(uri);
-                const codeLine = doc.lineAt(line).text;
-                const fullText = await queryModelStream(codeLine);
-                if (!fullText)
-                    return;
-                const parsed = parseHRA(fullText);
-                const hra = { ...parsed, fetched: true, hintOpened: false, reasoningOpened: false, answerOpened: false };
-                hraCache.set(k, hra);
-                // 不立即保存，等到用户再次运行 Python 文件时再保存
-            }
-            catch (e) {
-                console.error('[IRA] Prefetch error:', e);
-            }
-        })();
-    }));
-    // Show Hint: fetch once if needed and cache, then display Hint and a "Show Reasoning" button
-    context.subscriptions.push(vscode.commands.registerCommand('ida.showHintForLine', async (uriStr, line) => {
-        const uri = vscode.Uri.parse(uriStr);
-        const k = keyFor(uri, line);
-        let hra = hraCache.get(k);
-        if (!hra || !hra.fetched) {
-            // First fetch
+        // Start model request immediately
+        try {
             const doc = await vscode.workspace.openTextDocument(uri);
             const codeLine = doc.lineAt(line).text;
             const fullText = await queryModelStream(codeLine);
             if (!fullText) {
-                vscode.window.showErrorMessage('Failed to get response from model.');
+                thread.comments = [
+                    {
+                        mode: vscode.CommentMode.Preview,
+                        author: { name: 'IRA 🤖' },
+                        body: new vscode.MarkdownString('❌ **Failed to get response from model.**')
+                    }
+                ];
+                // Mark this line as processed even on failure so the CodeLens disappears
+                processedLines.add(k);
+                console.log(`[IRA] Line ${line + 1} marked as processed (failure). processedLines size: ${processedLines.size}`);
                 return;
             }
             const parsed = parseHRA(fullText);
-            hra = { ...parsed, fetched: true, hintOpened: false, reasoningOpened: false, answerOpened: false };
+            const hra = { ...parsed, fetched: true, hintOpened: true, reasoningOpened: false, answerOpened: false };
             hraCache.set(k, hra);
-            // Do not save here; defer saving until the user finishes the flow
+            // Display Hint directly with Show Reasoning button
+            thread.comments = [
+                { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`💡 **Hint:** ${hra.hint}`) },
+                { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: cmdLink('👉 Show Reasoning', 'ida.showReasoningForLine', [uri.toString(), line]) }
+            ];
+            // Mark this line as processed so the CodeLens disappears
+            processedLines.add(k);
+            console.log(`[IRA] Line ${line + 1} marked as processed. processedLines size: ${processedLines.size}`);
         }
-        // 标记 Hint 已打开
-        hra.hintOpened = true;
-        hraCache.set(k, hra);
-        // 不立即保存，等到用户"用完"功能时再保存
-        const thread = activeThreads.get(uri.toString());
-        if (!thread)
-            return;
-        // Rebuild comments: keep Hint and provide a "Show Reasoning" button
-        thread.comments = [
-            { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`💡 **Hint:** ${hra.hint}`) },
-            { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: cmdLink('👉 Show Reasoning', 'ida.showReasoningForLine', [uriStr, line]) }
-        ];
+        catch (e) {
+            console.error('[IRA] Model request error:', e);
+            thread.comments = [
+                {
+                    mode: vscode.CommentMode.Preview,
+                    author: { name: 'IRA 🤖' },
+                    body: new vscode.MarkdownString('❌ **Error occurred while generating response.**')
+                }
+            ];
+            // Mark this line as processed even on error so the CodeLens disappears
+            processedLines.add(k);
+            console.log(`[IRA] Line ${line + 1} marked as processed (error). processedLines size: ${processedLines.size}`);
+        }
+        pendingReasonKeys.delete(k);
+        vscode.commands.executeCommand('vscode.executeCodeLensProvider', uri);
     }));
     // Show Reasoning: display cached Reasoning and provide a "Show Answer" button
     context.subscriptions.push(vscode.commands.registerCommand('ida.showReasoningForLine', (uriStr, line) => {
@@ -234,7 +226,7 @@ function activate(context) {
         // Mark Reasoning as opened
         hra.reasoningOpened = true;
         hraCache.set(k, hra);
-        // 不立即保存，等到用户"用完"功能时再保存
+        // Not saving here; saving happens during file activation logic
         const thread = activeThreads.get(uri.toString());
         if (!thread)
             return;
@@ -246,7 +238,7 @@ function activate(context) {
         ];
     }));
     // Show Answer: display Answer and mark this line as processed
-    context.subscriptions.push(vscode.commands.registerCommand('ida.showAnswerForLine', (uriStr, line) => {
+    context.subscriptions.push(vscode.commands.registerCommand('ida.showAnswerForLine', async (uriStr, line) => {
         const uri = vscode.Uri.parse(uriStr);
         const k = keyFor(uri, line);
         const hra = hraCache.get(k);
@@ -255,8 +247,7 @@ function activate(context) {
         // Mark Answer as opened
         hra.answerOpened = true;
         hraCache.set(k, hra);
-        // Not saving here; saving happens when the user presses Done or during file activation logic
-        // saveHRAToFile(uri, line, hra); // This line is removed
+        // Not saving here; saving happens during file activation logic
         // Rebuild comments: show the final Answer and remove buttons
         const thread = activeThreads.get(uri.toString());
         if (!thread)
@@ -267,6 +258,9 @@ function activate(context) {
             { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`✅ **Answer:**\n\n${hra.answer}`) }
         ];
         processedLines.add(k);
+        // Auto-save when user completes the full flow
+        saveAllHRADataForFile(uri);
+        console.log('[IRA] Auto-saved HRA data after showing Answer');
     }));
     // Only show a CodeLens on lines pending explanation
     context.subscriptions.push(vscode.languages.registerCodeLensProvider({ language: 'python' }, {
@@ -275,7 +269,11 @@ function activate(context) {
             for (let i = 0; i < document.lineCount; i++) {
                 const k = keyFor(document.uri, i);
                 if (pendingReasonKeys.has(k) && !processedLines.has(k)) {
-                    lenses.push(new vscode.CodeLens(new vscode.Range(i, 0, i, 0), { title: '🔍 Give me reasoning', command: 'ida.addComment', arguments: [document.uri, i] }));
+                    console.log(`[IRA] Showing CodeLens for line ${i + 1}, key: ${k}`);
+                    lenses.push(new vscode.CodeLens(new vscode.Range(i, 0, i, 0), { title: '🔍 Give me hint', command: 'ida.addComment', arguments: [document.uri, i] }));
+                }
+                else {
+                    console.log(`[IRA] No CodeLens for line ${i + 1}, key: ${k}, pending: ${pendingReasonKeys.has(k)}, processed: ${processedLines.has(k)}`);
                 }
             }
             return lenses;
@@ -286,7 +284,6 @@ function activate(context) {
     panel.webview.html = getWebviewContent();
     panel.webview.onDidReceiveMessage(async (msg) => {
         if (msg.command === 'enableHint') {
-            isHintEnabled = true;
             const editor = vscode.window.activeTextEditor;
             if (!editor)
                 return;
@@ -335,14 +332,14 @@ function getWebviewContent() {
 }
 // Model: fetch once via streaming and display step-by-step
 async function queryModelStream(codeSnippet) {
-    console.log('[IRA] Querying model for code:', codeSnippet); // 调试日志
+    console.log('[IRA] Querying model for code:', codeSnippet);
     const prompt = `You are a concise and accurate Python assistant.
 
 Analyze the following Python code and return your response in exactly this format:
 
 Hint: <a one-sentence hint that guides the user toward the issue, without revealing the fix>
 Reasoning: <a brief explanation of what the error is and why it happens, without including the fix>
-Answer: <the corrected line of Python code only>
+Answer: <the mistaken code and the corrected line of Python code only, without any additional explanation>
 
 Respond with no extra explanation or formatting. Only include the 3 lines above.
 
@@ -352,7 +349,7 @@ Code:
 ${codeSnippet}
 \`\`\`
 [END]`;
-    console.log('[IRA] Sending prompt:', prompt); // 调试日志
+    console.log('[IRA] Sending prompt:', prompt);
     let result = '';
     try {
         const stream = await client.chatCompletionStream({
@@ -367,7 +364,7 @@ ${codeSnippet}
             if (delta)
                 result += delta;
         }
-        console.log('[IRA] API response received:', result); // 调试日志
+        console.log('[IRA] API response received:', result);
         return result;
     }
     catch (err) {

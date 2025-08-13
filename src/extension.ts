@@ -9,10 +9,9 @@ import * as path from 'path';
 
 config();
 
-const HF_TOKEN = process.env.HF_TOKEN || 'change this to your Hugging Face token';
+const HF_TOKEN = process.env.HF_TOKEN || 'replace_with_your_token';
 const client = new InferenceClient(HF_TOKEN);
 
-let isHintEnabled = false;
 const activeThreads = new Map<string, vscode.CommentThread>();
 
 // Lines that should show a CodeLens
@@ -176,68 +175,65 @@ export function activate(context: vscode.ExtensionContext) {
       thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
       activeThreads.set(uri.toString(), thread);
 
-      // Initially show only the "Show Hint" button
+      // Show loading state immediately
       thread.comments = [
         {
           mode: vscode.CommentMode.Preview,
           author: { name: 'IRA 🤖' },
-          body: cmdLink('👉 Show Hint', 'ida.showHintForLine', [uri.toString(), line])
+          body: new vscode.MarkdownString('🤖 **AI is generating...**')
         }
       ];
 
-      // Prefetch asynchronously after CodeLens click (non-blocking)
-      (async () => {
-        try {
-          const existing = hraCache.get(k);
-          if (existing?.fetched) return;
-          const doc = await vscode.workspace.openTextDocument(uri);
-          const codeLine = doc.lineAt(line).text;
-          const fullText = await queryModelStream(codeLine);
-          if (!fullText) return;
-          const parsed = parseHRA(fullText);
-          const hra = { ...parsed, fetched: true, hintOpened: false, reasoningOpened: false, answerOpened: false };
-          hraCache.set(k, hra);
-        } catch (e) {
-          console.error('[IRA] Prefetch error:', e);
-        }
-      })();
-    })
-  );
-
-  // Show Hint: fetch once if needed and cache, then display Hint and a "Show Reasoning" button
-  context.subscriptions.push(
-    vscode.commands.registerCommand('ida.showHintForLine', async (uriStr: string, line: number) => {
-      const uri = vscode.Uri.parse(uriStr);
-      const k = keyFor(uri, line);
-
-      let hra = hraCache.get(k);
-      if (!hra || !hra.fetched) {
-        // First fetch
+      // Start model request immediately
+      try {
         const doc = await vscode.workspace.openTextDocument(uri);
         const codeLine = doc.lineAt(line).text;
         const fullText = await queryModelStream(codeLine);
+        
         if (!fullText) {
-          vscode.window.showErrorMessage('Failed to get response from model.');
+          thread.comments = [
+            {
+              mode: vscode.CommentMode.Preview,
+              author: { name: 'IRA 🤖' },
+              body: new vscode.MarkdownString('❌ **Failed to get response from model.**')
+            }
+          ];
+          // Mark this line as processed even on failure so the CodeLens disappears
+          processedLines.add(k);
+          console.log(`[IRA] Line ${line + 1} marked as processed (failure). processedLines size: ${processedLines.size}`);
           return;
         }
+        
         const parsed = parseHRA(fullText);
-        hra = { ...parsed, fetched: true, hintOpened: false, reasoningOpened: false, answerOpened: false };
+        const hra = { ...parsed, fetched: true, hintOpened: true, reasoningOpened: false, answerOpened: false };
         hraCache.set(k, hra);
-        // Do not save here; defer saving until the user finishes the flow
+
+        // Display Hint directly with Show Reasoning button
+        thread.comments = [
+          { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`💡 **Hint:** ${hra.hint}`) },
+          { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: cmdLink('👉 Show Reasoning', 'ida.showReasoningForLine', [uri.toString(), line]) }
+        ];
+
+        // Mark this line as processed so the CodeLens disappears
+        processedLines.add(k);
+        console.log(`[IRA] Line ${line + 1} marked as processed. processedLines size: ${processedLines.size}`);
+
+      } catch (e) {
+        console.error('[IRA] Model request error:', e);
+        thread.comments = [
+          {
+            mode: vscode.CommentMode.Preview,
+            author: { name: 'IRA 🤖' },
+            body: new vscode.MarkdownString('❌ **Error occurred while generating response.**')
+          }
+        ];
+        // Mark this line as processed even on error so the CodeLens disappears
+        processedLines.add(k);
+        console.log(`[IRA] Line ${line + 1} marked as processed (error). processedLines size: ${processedLines.size}`);
       }
 
-      hra.hintOpened = true;
-      hraCache.set(k, hra);
-      // Not saving here; saving happens when the user presses Done or during file activation logic
-
-      const thread = activeThreads.get(uri.toString());
-      if (!thread) return;
-
-      // Rebuild comments: keep Hint and provide a "Show Reasoning" button
-      thread.comments = [
-        { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`💡 **Hint:** ${hra.hint}`) },
-        { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: cmdLink('👉 Show Reasoning', 'ida.showReasoningForLine', [uriStr, line]) }
-      ];
+      pendingReasonKeys.delete(k);
+      vscode.commands.executeCommand('vscode.executeCodeLensProvider', uri);
     })
   );
 
@@ -252,7 +248,7 @@ export function activate(context: vscode.ExtensionContext) {
       // Mark Reasoning as opened
       hra.reasoningOpened = true;
       hraCache.set(k, hra);
-      // Not saving here; saving happens when the user presses Done or during file activation logic
+      // Not saving here; saving happens during file activation logic
 
       const thread = activeThreads.get(uri.toString());
       if (!thread) return;
@@ -268,7 +264,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Show Answer: display Answer and mark this line as processed
   context.subscriptions.push(
-    vscode.commands.registerCommand('ida.showAnswerForLine', (uriStr: string, line: number) => {
+    vscode.commands.registerCommand('ida.showAnswerForLine', async (uriStr: string, line: number) => {
       const uri = vscode.Uri.parse(uriStr);
       const k = keyFor(uri, line);
       const hra = hraCache.get(k);
@@ -278,8 +274,7 @@ export function activate(context: vscode.ExtensionContext) {
       hra.answerOpened = true;
       hraCache.set(k, hra);
       
-      // Not saving here; saving happens when the user presses Done or during file activation logic
-      // saveHRAToFile(uri, line, hra); // This line is removed
+      // Not saving here; saving happens during file activation logic
 
       // Rebuild comments: show the final Answer and remove buttons
       const thread = activeThreads.get(uri.toString());
@@ -291,6 +286,10 @@ export function activate(context: vscode.ExtensionContext) {
       ];
 
       processedLines.add(k);
+      
+      // Auto-save when user completes the full flow
+      saveAllHRADataForFile(uri);
+      console.log('[IRA] Auto-saved HRA data after showing Answer');
     })
   );
 
@@ -302,10 +301,13 @@ export function activate(context: vscode.ExtensionContext) {
         for (let i = 0; i < document.lineCount; i++) {
           const k = keyFor(document.uri, i);
           if (pendingReasonKeys.has(k) && !processedLines.has(k)) {
+            console.log(`[IRA] Showing CodeLens for line ${i + 1}, key: ${k}`);
             lenses.push(new vscode.CodeLens(
               new vscode.Range(i, 0, i, 0),
-              { title: '🔍 Give me reasoning', command: 'ida.addComment', arguments: [document.uri, i] }
+              { title: '🔍 Give me hint', command: 'ida.addComment', arguments: [document.uri, i] }
             ));
+          } else {
+            console.log(`[IRA] No CodeLens for line ${i + 1}, key: ${k}, pending: ${pendingReasonKeys.has(k)}, processed: ${processedLines.has(k)}`);
           }
         }
         return lenses;
@@ -319,7 +321,6 @@ export function activate(context: vscode.ExtensionContext) {
 
   panel.webview.onDidReceiveMessage(async msg => {
     if (msg.command === 'enableHint') {
-      isHintEnabled = true;
       const editor = vscode.window.activeTextEditor;
       if (!editor) return;
       const filePath = editor.document.uri.fsPath;
@@ -382,7 +383,7 @@ Analyze the following Python code and return your response in exactly this forma
 
 Hint: <a one-sentence hint that guides the user toward the issue, without revealing the fix>
 Reasoning: <a brief explanation of what the error is and why it happens, without including the fix>
-Answer: <the corrected line of Python code only>
+Answer: <the mistaken code and the corrected line of Python code only, without any additional explanation>
 
 Respond with no extra explanation or formatting. Only include the 3 lines above.
 
