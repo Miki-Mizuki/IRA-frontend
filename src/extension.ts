@@ -9,7 +9,7 @@ import * as path from 'path';
 
 config();
 
-const HF_TOKEN = process.env.HF_TOKEN || 'replace_with_your_token';
+const HF_TOKEN = process.env.HF_TOKEN || 'your_huggingface_token_here';
 const client = new InferenceClient(HF_TOKEN);
 
 const activeThreads = new Map<string, vscode.CommentThread>();
@@ -22,11 +22,11 @@ const processedLines = new Set<string>();
 // Cache per-line Hint/Reasoning/Answer to avoid repeated API calls
 type HRA = { 
   hint: string; 
-  reasoning: string; 
+  define: string; 
   answer: string; 
   fetched: boolean;
   hintOpened?: boolean;
-  reasoningOpened?: boolean;
+  defineOpened?: boolean;
   answerOpened?: boolean;
 };
 const hraCache = new Map<string, HRA>();
@@ -45,42 +45,72 @@ function cmdLink(title: string, command: string, args: unknown[]): vscode.Markdo
 }
 
 // Parse the model output (more robust)
-function parseHRA(raw: string): { hint: string; reasoning: string; answer: string } {
+function parseHRA(raw: string): { hint: string; define: string; answer: string } {
   console.log('[IRA] Raw API response:', raw);
   
   if (!raw || typeof raw !== 'string') {
     console.log('[IRA] Invalid raw response:', raw);
-    return { hint: 'No hint.', reasoning: 'No reasoning.', answer: 'No answer.' };
+    return { hint: 'No hint.', define: 'This line has a syntax error that needs to be fixed.', answer: 'No answer.' };
   }
 
-  const hintMatch = raw.match(/^\s*Hint\s*:\s*(.*?)(?=^\s*Reasoning\s*:|^\s*Answer\s*:|$)/ims);
-  const reasoningMatch = raw.match(/^\s*Reasoning\s*:\s*(.*?)(?=^\s*Answer\s*:|$)/ims);
+  const hintMatch = raw.match(/^\s*Hint\s*:\s*(.*?)(?=^\s*Answer\s*:|$)/ims);
   const answerMatch = raw.match(/^\s*Answer\s*:\s*([\s\S]*)$/im);
 
   let hint = hintMatch?.[1]?.trim();
-  let reasoning = reasoningMatch?.[1]?.trim();
   let answer = answerMatch?.[1]?.trim();
 
-  console.log('[IRA] Parsed matches:', { hint, reasoning, answer });
+  console.log('[IRA] Parsed matches:', { hint, answer });
 
-  if (!hint || !reasoning || !answer) {
+  if (!hint || !answer) {
     // Fallback: line-based extraction
     const lines = raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
     const findLine = (prefix: string) =>
       lines.find(l => l.toLowerCase().startsWith(prefix))?.replace(/^.*?:\s*/i, '').trim();
     hint = hint || findLine('hint') || 'No hint.';
-    reasoning = reasoning || findLine('reasoning') || 'No reasoning.';
     answer = answer || findLine('answer') || 'No answer.';
 
-    console.log('[IRA] Fallback parsing result:', { hint, reasoning, answer });
+    console.log('[IRA] Fallback parsing result:', { hint, answer });
   }
 
-  // Wrap Answer in a code block for clarity
-  if (!/```/.test(answer)) {
-    answer = `\`\`\`python\n${answer}\n\`\`\``;
+  // Normalize Answer to single-line "Original: ... → Corrected: ..."
+  let answerText = answer
+    .replace(/```[a-zA-Z]*\n?/g, '')
+    .replace(/```/g, '')
+    .trim();
+
+  // Extract content after "Format:" up to the first quote
+  const formatMatch = answerText.match(/Format\s*:\s*"([^"]*)/);
+  if (formatMatch) {
+    answerText = formatMatch[1];
   }
 
-  return { hint, reasoning, answer };
+  let original = '';
+  let corrected = '';
+  const pair = answerText.match(/Original\s*:\s*([\s\S]*?)\s*→\s*Corrected\s*:\s*([\s\S]*?)\s*$/);
+  if (pair) {
+    original = pair[1].trim();
+    corrected = pair[2].trim();
+  } else {
+    const lines = answerText.split(/\r?\n+/).map(s => s.trim()).filter(Boolean);
+    if (lines.length >= 2) {
+      original = lines[0];
+      corrected = lines[1];
+    } else if (lines.length === 1) {
+      corrected = lines[0];
+    }
+  }
+
+  const collapse = (s: string) => s.replace(/\s+/g, ' ').trim();
+  original = collapse(original);
+  corrected = collapse(corrected);
+
+  const normalizedAnswer = `Original: ${original || '?'} → Corrected: ${corrected || '?'}`;
+
+  return { 
+    hint, 
+    define: 'This line has a syntax error that needs to be fixed.', // Fixed define
+    answer: normalizedAnswer 
+  };
 }
 
 // Save HRA data to a local JSON file
@@ -100,10 +130,10 @@ function saveHRAToFile(uri: vscode.Uri, line: number, hra: HRA) {
       line: line + 1,
       timestamp: new Date().toISOString(),
       hint: hra.hint,
-      reasoning: hra.reasoning,
+      define: hra.define,
       answer: hra.answer,
       hintOpened: hra.hintOpened || false,
-      reasoningOpened: hra.reasoningOpened || false,
+      defineOpened: hra.defineOpened || false,
       answerOpened: hra.answerOpened || false
     };
 
@@ -111,6 +141,50 @@ function saveHRAToFile(uri: vscode.Uri, line: number, hra: HRA) {
     console.log(`[IRA] Saved HRA data to: ${jsonPath}`);
   } catch (err) {
     console.error('[IRA] Failed to save HRA data:', err);
+  }
+}
+
+// Save all HRA data for the current file to a local JSON file
+async function saveAllHRADataForFile(uri: vscode.Uri) {
+  const fileName = path.basename(uri.fsPath, path.extname(uri.fsPath));
+  const dataDir = path.join('/Users/mikimizuki/IRA-frontend', 'ira-data');
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+
+  const jsonPath = path.join(dataDir, `${fileName}.json`);
+  const allHRAData: { [key: string]: any } = {};
+
+  // Collect all HRA data for this file
+  for (const [key, hra] of hraCache.entries()) {
+    const match = key.match(/^(.+):(\d+)$/);
+    if (!match) continue;
+    const uriStr = match[1];
+    const line = parseInt(match[2], 10);
+
+    if (vscode.Uri.parse(uriStr).fsPath === uri.fsPath) {
+      allHRAData[key] = {
+        file: uri.fsPath,
+        line: line + 1,
+        timestamp: new Date().toISOString(),
+        hint: hra.hint,
+        define: hra.define,
+        answer: hra.answer,
+        hintOpened: hra.hintOpened || false,
+        defineOpened: hra.defineOpened || false,
+        answerOpened: hra.answerOpened || false,
+        stepsCompleted: [
+          hra.hintOpened && 'hint',
+          hra.defineOpened && 'define', 
+          hra.answerOpened && 'answer'
+        ].filter(Boolean)
+      };
+    }
+  }
+
+  if (Object.keys(allHRAData).length > 0) {
+    fs.writeFileSync(jsonPath, JSON.stringify(allHRAData, null, 2), 'utf8');
+    console.log(`[IRA] Saved all HRA data for ${fileName} to: ${jsonPath}`);
   }
 }
 
@@ -205,13 +279,13 @@ export function activate(context: vscode.ExtensionContext) {
         }
         
         const parsed = parseHRA(fullText);
-        const hra = { ...parsed, fetched: true, hintOpened: true, reasoningOpened: false, answerOpened: false };
+        const hra = { ...parsed, fetched: true, hintOpened: false, defineOpened: true, answerOpened: false };
         hraCache.set(k, hra);
 
-        // Display Hint directly with Show Reasoning button
+        // Display Define with Show Hint button only
         thread.comments = [
-          { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`💡 **Hint:** ${hra.hint}`) },
-          { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: cmdLink('👉 Show Reasoning', 'ida.showReasoningForLine', [uri.toString(), line]) }
+          { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`📚 **Define:** ${hra.define}`) },
+          { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: cmdLink('👉 Show Hint', 'ida.showHintForLine', [uri.toString(), line]) }
         ];
 
         // Mark this line as processed so the CodeLens disappears
@@ -237,26 +311,50 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Show Reasoning: display cached Reasoning and provide a "Show Answer" button
+  // Show Hint: display cached Hint
   context.subscriptions.push(
-    vscode.commands.registerCommand('ida.showReasoningForLine', (uriStr: string, line: number) => {
+    vscode.commands.registerCommand('ida.showHintForLine', (uriStr: string, line: number) => {
       const uri = vscode.Uri.parse(uriStr);
       const k = keyFor(uri, line);
       const hra = hraCache.get(k);
       if (!hra) return;
 
-      // Mark Reasoning as opened
-      hra.reasoningOpened = true;
+      // Mark Hint as opened
+      hra.hintOpened = true;
+      hraCache.set(k, hra);
+
+      const thread = activeThreads.get(uri.toString());
+      if (!thread) return;
+
+      // Rebuild comments: show Define, Hint, and provide Show Answer button
+      thread.comments = [
+        { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`📚 **Define:** ${hra.define}`) },
+        { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`💡 **Hint:** ${hra.hint}`) },
+        { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: cmdLink('👉 Show Answer', 'ida.showAnswerForLine', [uriStr, line]) }
+      ];
+    })
+  );
+
+  // Show Define: display cached Define and provide a "Show Answer" button
+  context.subscriptions.push(
+    vscode.commands.registerCommand('ida.showDefineForLine', (uriStr: string, line: number) => {
+      const uri = vscode.Uri.parse(uriStr);
+      const k = keyFor(uri, line);
+      const hra = hraCache.get(k);
+      if (!hra) return;
+
+      // Mark Define as opened
+      hra.defineOpened = true;
       hraCache.set(k, hra);
       // Not saving here; saving happens during file activation logic
 
       const thread = activeThreads.get(uri.toString());
       if (!thread) return;
 
-      // Rebuild comments: keep Hint and Reasoning, provide "Show Answer", remove "Show Reasoning"
+      // Rebuild comments: keep Hint and Define, provide "Show Answer", remove "Show Define"
       thread.comments = [
         { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`💡 **Hint:** ${hra.hint}`) },
-        { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`🧠 **Reasoning:** ${hra.reasoning}`) },
+        { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`📚 **Define:** ${hra.define}`) },
         { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: cmdLink('👉 Show Answer', 'ida.showAnswerForLine', [uriStr, line]) }
       ];
     })
@@ -280,8 +378,8 @@ export function activate(context: vscode.ExtensionContext) {
       const thread = activeThreads.get(uri.toString());
       if (!thread) return;
       thread.comments = [
+        { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`📚 **Define:** ${hra.define}`) },
         { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`💡 **Hint:** ${hra.hint}`) },
-        { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`🧠 **Reasoning:** ${hra.reasoning}`) },
         { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`✅ **Answer:**\n\n${hra.answer}`) }
       ];
 
@@ -382,10 +480,9 @@ async function queryModelStream(codeSnippet: string): Promise<string> {
 Analyze the following Python code and return your response in exactly this format:
 
 Hint: <a one-sentence hint that guides the user toward the issue, without revealing the fix>
-Reasoning: <a brief explanation of what the error is and why it happens, without including the fix>
-Answer: <the mistaken code and the corrected line of Python code only, without any additional explanation>
+Answer: <show the original error line and the corrected line, format as: "Original: <error line> → Corrected: <fixed line>">
 
-Respond with no extra explanation or formatting. Only include the 3 lines above.
+Respond with no extra explanation or formatting. Only include the 2 lines above.
 
 Code:
 [START]
@@ -419,59 +516,4 @@ ${codeSnippet}
   }
 }
 
-// Save all HRA data for the current file to a local JSON file
-// Save whatever steps the user has opened so far (Hint/Reasoning/Answer)
-async function saveAllHRADataForFile(uri: vscode.Uri) {
-  const fileName = path.basename(uri.fsPath, path.extname(uri.fsPath));
-  const dataDir = path.join('/Users/mikimizuki/IRA-frontend', 'ira-data');
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-  }
-
-  const jsonPath = path.join(dataDir, `${fileName}.json`);
-  const allHRAData: { [key: string]: any } = {};
-
-  // Collect all HRA data for this file (regardless of how many steps were opened)
-  for (const [key, hra] of hraCache.entries()) {
-    const match = key.match(/^(.+):(\d+)$/);
-    if (!match) continue;
-    const uriStr = match[1];
-    const line = parseInt(match[2], 10);
-
-    if (vscode.Uri.parse(uriStr).fsPath === uri.fsPath) {
-      allHRAData[key] = {
-        file: uri.fsPath,
-        line: line + 1,
-        timestamp: new Date().toISOString(),
-        hint: hra.hint,
-        reasoning: hra.reasoning,
-        answer: hra.answer,
-        hintOpened: hra.hintOpened || false,
-        reasoningOpened: hra.reasoningOpened || false,
-        answerOpened: hra.answerOpened || false,
-        // Record which steps the user actually opened
-        stepsCompleted: [
-          hra.hintOpened && 'hint',
-          hra.reasoningOpened && 'reasoning', 
-          hra.answerOpened && 'answer'
-        ].filter(Boolean)
-      };
-    }
-  }
-
-  if (Object.keys(allHRAData).length > 0) {
-    fs.writeFileSync(jsonPath, JSON.stringify(allHRAData, null, 2), 'utf8');
-    console.log(`[IRA] Saved all HRA data for ${fileName} to: ${jsonPath}`);
-    console.log(`[IRA] User completed steps:`, Object.values(allHRAData).map(d => d.stepsCompleted));
-  } else {
-    // If there is no data, delete the empty file
-    if (fs.existsSync(jsonPath)) {
-      fs.unlinkSync(jsonPath);
-      console.log(`[IRA] Deleted empty HRA data file for ${fileName}: ${jsonPath}`);
-    }
-  }
-}
-
 export function deactivate() {}
-
-
