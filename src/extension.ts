@@ -14,7 +14,8 @@ const client = new InferenceClient(HF_TOKEN);
 
 const activeThreads = new Map<string, vscode.CommentThread>();
 
-
+// Lines that should show a CodeLens
+const pendingReasonKeys = new Set<string>();
 // Lines already processed (avoid duplicates)
 const processedLines = new Set<string>();
 
@@ -477,7 +478,8 @@ export function activate(context: vscode.ExtensionContext) {
 
           const k = keyFor(doc.uri, errorLine - 1);
           if (!processedLines.has(k)) {
-            // Directly create comment thread instead of showing CodeLens
+            pendingReasonKeys.add(k);
+            // Instead of showing CodeLens, directly create comment thread
             await createCommentThreadForLine(doc.uri, errorLine - 1);
           }
         } catch (err) {
