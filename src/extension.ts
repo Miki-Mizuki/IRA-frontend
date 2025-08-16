@@ -9,7 +9,7 @@ import * as path from 'path';
 
 config();
 
-const HF_TOKEN = process.env.HF_TOKEN || 'your_token';
+const HF_TOKEN = process.env.HF_TOKEN || 'your_huggingface_token_here';
 const client = new InferenceClient(HF_TOKEN);
 
 const activeThreads = new Map<string, vscode.CommentThread>();
@@ -188,65 +188,6 @@ async function saveAllHRADataForFile(uri: vscode.Uri) {
   }
 }
 
-function getWebviewContent() {
-  return `<!DOCTYPE html>
-  <html><body style="background:#1e1e1e;color:white;padding:1em;font-family:sans-serif">
-  <h2>🤖 IRA</h2>
-  <p>Don't panic! We've seen this before.<br>Shall we go through it together?</p>
-  <button onclick="enableHint()">Yes please</button>
-  <script>
-    const vscode = acquireVsCodeApi();
-    function enableHint() { vscode.postMessage({ command: 'enableHint' }); }
-  </script>
-  </body></html>`;
-}
-
-// Model: fetch once via streaming and display step-by-step
-async function queryModelStream(codeSnippet: string): Promise<string> {
-  console.log('[IRA] Querying model for code:', codeSnippet);
-  
-  const prompt =
-`You are a concise and accurate Python assistant.
-
-Analyze the following Python code and return your response in exactly this format:
-
-Hint: <a one-sentence hint that guides the user toward the issue, without revealing the fix>
-Answer: <show the original error line and the corrected line, format as: "Original: <error line> → Corrected: <fixed line>">
-
-Respond with no extra explanation or formatting. Only include the 2 lines above.
-
-Code:
-[START]
-\`\`\`python
-${codeSnippet}
-\`\`\`
-[END]`;
-
-  console.log('[IRA] Sending prompt:', prompt);
-
-  let result = '';
-  try {
-    const stream = await client.chatCompletionStream({
-      provider: 'featherless-ai',
-      model: 'nvidia/OpenReasoning-Nemotron-32B',
-      temperature: 0,
-      max_tokens: 512,
-      messages: [{ role: 'user', content: prompt }]
-    });
-
-    for await (const chunk of stream) {
-      const delta = chunk.choices?.[0]?.delta?.content;
-      if (delta) result += delta;
-    }
-    
-    console.log('[IRA] API response received:', result);
-    return result;
-  } catch (err) {
-    console.error('[IRA] 🔥 Streaming fetch error:', err);
-    return '';
-  }
-}
-
 export function activate(context: vscode.ExtensionContext) {
   console.log('[IRA] Extension is active!');
 
@@ -290,7 +231,85 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // On CodeLens click: create thread and buttons only (no model request yet)
+  context.subscriptions.push(
+    vscode.commands.registerCommand('ida.addComment', async (uri: vscode.Uri, line: number) => {
+      const k = keyFor(uri, line);
+      if (processedLines.has(k)) {
+        vscode.window.showInformationMessage('Already explained for this line.');
+        return;
+      }
 
+      const thread = commentController.createCommentThread(
+        uri,
+        new vscode.Range(line, 0, line, 0),
+        []
+      );
+      thread.canReply = false;
+      thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+      activeThreads.set(uri.toString(), thread);
+
+      // Show loading state immediately
+      thread.comments = [
+        {
+          mode: vscode.CommentMode.Preview,
+          author: { name: 'IRA 🤖' },
+          body: new vscode.MarkdownString('🤖 **AI is generating...**')
+        }
+      ];
+
+      // Start model request immediately
+      try {
+        const doc = await vscode.workspace.openTextDocument(uri);
+        const codeLine = doc.lineAt(line).text;
+        const fullText = await queryModelStream(codeLine);
+        
+        if (!fullText) {
+          thread.comments = [
+            {
+              mode: vscode.CommentMode.Preview,
+              author: { name: 'IRA 🤖' },
+              body: new vscode.MarkdownString('❌ **Failed to get response from model.**')
+            }
+          ];
+          // Mark this line as processed even on failure so the CodeLens disappears
+          processedLines.add(k);
+          console.log(`[IRA] Line ${line + 1} marked as processed (failure). processedLines size: ${processedLines.size}`);
+          return;
+        }
+        
+        const parsed = parseHRA(fullText);
+        const hra = { ...parsed, fetched: true, hintOpened: false, defineOpened: true, answerOpened: false };
+        hraCache.set(k, hra);
+
+        // Display Define with Show Hint button only
+        thread.comments = [
+          { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`📚 **Define:** ${hra.define}`) },
+          { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: cmdLink('👉 Show Hint', 'ida.showHintForLine', [uri.toString(), line]) }
+        ];
+
+        // Mark this line as processed so the CodeLens disappears
+        processedLines.add(k);
+        console.log(`[IRA] Line ${line + 1} marked as processed. processedLines size: ${processedLines.size}`);
+
+      } catch (e) {
+        console.error('[IRA] Model request error:', e);
+        thread.comments = [
+          {
+            mode: vscode.CommentMode.Preview,
+            author: { name: 'IRA 🤖' },
+            body: new vscode.MarkdownString('❌ **Error occurred while generating response.**')
+          }
+        ];
+        // Mark this line as processed even on error so the CodeLens disappears
+        processedLines.add(k);
+        console.log(`[IRA] Line ${line + 1} marked as processed (error). processedLines size: ${processedLines.size}`);
+      }
+
+      pendingReasonKeys.delete(k);
+      vscode.commands.executeCommand('vscode.executeCodeLensProvider', uri);
+    })
+  );
 
   // Show Hint: display cached Hint
   context.subscriptions.push(
@@ -372,82 +391,27 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-
-
-  // Helper function to create comment thread directly
-  async function createCommentThreadForLine(uri: vscode.Uri, line: number) {
-    const k = keyFor(uri, line);
-    if (processedLines.has(k)) {
-      vscode.window.showInformationMessage('Already explained for this line.');
-      return;
-    }
-
-    const thread = commentController.createCommentThread(
-      uri,
-      new vscode.Range(line, 0, line, 0),
-      []
-    );
-    thread.canReply = false;
-    thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
-    activeThreads.set(uri.toString(), thread);
-
-    // Show loading state immediately
-    thread.comments = [
-      {
-        mode: vscode.CommentMode.Preview,
-        author: { name: 'IRA 🤖' },
-        body: new vscode.MarkdownString('🤖 **AI is generating...**')
-      }
-    ];
-
-    // Start model request immediately
-    try {
-      const doc = await vscode.workspace.openTextDocument(uri);
-      const codeLine = doc.lineAt(line).text;
-      const fullText = await queryModelStream(codeLine);
-      
-      if (!fullText) {
-        thread.comments = [
-          {
-            mode: vscode.CommentMode.Preview,
-            author: { name: 'IRA 🤖' },
-            body: new vscode.MarkdownString('❌ **Failed to get response from model.**')
+  // Only show a CodeLens on lines pending explanation
+  context.subscriptions.push(
+    vscode.languages.registerCodeLensProvider({ language: 'python' }, {
+      provideCodeLenses(document) {
+        const lenses: vscode.CodeLens[] = [];
+        for (let i = 0; i < document.lineCount; i++) {
+          const k = keyFor(document.uri, i);
+          if (pendingReasonKeys.has(k) && !processedLines.has(k)) {
+            console.log(`[IRA] Showing CodeLens for line ${i + 1}, key: ${k}`);
+            lenses.push(new vscode.CodeLens(
+              new vscode.Range(i, 0, i, 0),
+              { title: '🔍 Give me hint', command: 'ida.addComment', arguments: [document.uri, i] }
+            ));
+          } else {
+            console.log(`[IRA] No CodeLens for line ${i + 1}, key: ${k}, pending: ${pendingReasonKeys.has(k)}, processed: ${processedLines.has(k)}`);
           }
-        ];
-        // Mark this line as processed even on failure
-        processedLines.add(k);
-        console.log(`[IRA] Line ${line + 1} marked as processed (failure). processedLines size: ${processedLines.size}`);
-        return;
-      }
-      
-      const parsed = parseHRA(fullText);
-      const hra = { ...parsed, fetched: true, hintOpened: false, defineOpened: true, answerOpened: false };
-      hraCache.set(k, hra);
-
-      // Display Define with Show Hint button only
-      thread.comments = [
-        { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: new vscode.MarkdownString(`📚 **Define:** ${hra.define}`) },
-        { mode: vscode.CommentMode.Preview, author: { name: 'IRA 🤖' }, body: cmdLink('👉 Show Hint', 'ida.showHintForLine', [uri.toString(), line]) }
-      ];
-
-      // Mark this line as processed
-      processedLines.add(k);
-      console.log(`[IRA] Line ${line + 1} marked as processed. processedLines size: ${processedLines.size}`);
-
-    } catch (e) {
-      console.error('[IRA] Model request error:', e);
-      thread.comments = [
-        {
-          mode: vscode.CommentMode.Preview,
-          author: { name: 'IRA 🤖' },
-          body: new vscode.MarkdownString('❌ **Error occurred while generating response.**')
         }
-      ];
-      // Mark this line as processed even on error
-      processedLines.add(k);
-      console.log(`[IRA] Line ${line + 1} marked as processed (error). processedLines size: ${processedLines.size}`);
-    }
-  }
+        return lenses;
+      }
+    })
+  );
 
   // Webview (capture error line -> tag -> show CodeLens)
   const panel = vscode.window.createWebviewPanel('iraChat', 'IRA Chat', vscode.ViewColumn.Two, { enableScripts: true });
@@ -479,8 +443,7 @@ export function activate(context: vscode.ExtensionContext) {
           const k = keyFor(doc.uri, errorLine - 1);
           if (!processedLines.has(k)) {
             pendingReasonKeys.add(k);
-            // Instead of showing CodeLens, directly create comment thread
-            await createCommentThreadForLine(doc.uri, errorLine - 1);
+            vscode.commands.executeCommand('vscode.executeCodeLensProvider', doc.uri);
           }
         } catch (err) {
           console.error('[IRA] Failed to open error location:', err);
@@ -494,6 +457,64 @@ export function activate(context: vscode.ExtensionContext) {
   }, undefined, context.subscriptions);
 }
 
+function getWebviewContent() {
+  return `<!DOCTYPE html>
+  <html><body style="background:#1e1e1e;color:white;padding:1em;font-family:sans-serif">
+  <h2>🤖 IRA</h2>
+  <p>Don't panic! We've seen this before.<br>Shall we go through it together?</p>
+  <button onclick="enableHint()">Yes please</button>
+  <script>
+    const vscode = acquireVsCodeApi();
+    function enableHint() { vscode.postMessage({ command: 'enableHint' }); }
+  </script>
+  </body></html>`;
+}
 
+// Model: fetch once via streaming and display step-by-step
+async function queryModelStream(codeSnippet: string): Promise<string> {
+  console.log('[IRA] Querying model for code:', codeSnippet);
+  
+  const prompt =
+`You are a concise and accurate Python assistant.
+
+Analyze the following Python code and return your response in exactly this format:
+
+Hint: <a one-sentence hint that guides the user toward the issue, without revealing the fix>
+Answer: <show the original error line and the corrected line, format as: "Original: <error line> → Corrected: <fixed line>">
+
+Respond with no extra explanation or formatting. Only include the 2 lines above.
+
+Code:
+[START]
+\`\`\`python
+${codeSnippet}
+\`\`\`
+[END]`;
+
+  console.log('[IRA] Sending prompt:', prompt);
+
+  let result = '';
+  try {
+    const stream = await client.chatCompletionStream({
+      provider: 'featherless-ai',
+      model: 'nvidia/OpenReasoning-Nemotron-32B',
+      temperature: 0,
+      max_tokens: 512,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    for await (const chunk of stream) {
+      const delta = chunk.choices?.[0]?.delta?.content;
+      if (delta) result += delta;
+    }
+    
+    console.log('[IRA] API response received:', result);
+    return result;
+  } catch (err) {
+    console.error('[IRA] 🔥 Streaming fetch error:', err);
+    return '';
+  }
+}
 
 export function deactivate() {}
+
